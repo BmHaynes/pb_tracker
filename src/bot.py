@@ -1,10 +1,18 @@
 import os
 import re
+import logging
 
 import discord
 from dotenv import load_dotenv
 from googleapiclient.discovery import build
 from google.oauth2.service_account import Credentials
+
+# ---------------- Logging setup ---------------- #
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
 
 # ---------------- Load settings from .env ---------------- #
 
@@ -55,14 +63,20 @@ def write_headers(headers):
 
 
 def ensure_boss_columns(bosses, headers):
-    # First time, create basic headers
+    """
+    Headers are now:
+      0: Discord_name
+      1: RSN
+      2+: bosses
+    """
     if not headers:
-        headers = ["Discord ID", "Username"]
+        headers = ["Discord_name", "RSN"]
 
     existing = {h.lower() for h in headers if h}
     new_bosses = [b for b in bosses if b.lower() not in existing]
 
     if new_bosses:
+        logging.info(f"Adding new boss columns to sheet: {new_bosses}")
         headers = headers + new_bosses
         write_headers(headers)
 
@@ -73,19 +87,24 @@ def build_header_map(headers):
     return {h.lower(): i for i, h in enumerate(headers)}
 
 
-def find_user_row(values, discord_id):
-    # Find the row index (starting from 0) where this Discord ID is
+def find_row(values, discord_name, rsn):
+    """
+    Find row where:
+      col 0 == Discord_name
+      col 1 == RSN
+    """
     for row_index in range(1, len(values)):  # row 0 is headers
         row = values[row_index]
-        if row and row[0] == discord_id:
+        if len(row) >= 2 and row[0] == discord_name and row[1] == rsn:
             return row_index
     return -1
 
 
-def add_user_row(discord_id, username, col_count):
+def add_row(discord_name, rsn, col_count):
+    logging.info(f"Creating new row for Discord_name='{discord_name}', RSN='{rsn}'")
     new_row = [""] * col_count
-    new_row[0] = discord_id
-    new_row[1] = username
+    new_row[0] = discord_name
+    new_row[1] = rsn
 
     sheet.append(
         spreadsheetId=GOOGLE_SHEET_ID,
@@ -97,6 +116,7 @@ def add_user_row(discord_id, username, col_count):
 
 def update_cell(row, col, value):
     col_letter = col_to_letter(col)
+    logging.info(f"Updating cell {col_letter}{row + 1} to {value}")
     sheet.update(
         spreadsheetId=GOOGLE_SHEET_ID,
         range=f"BestTimes!{col_letter}{row + 1}",
@@ -105,26 +125,31 @@ def update_cell(row, col, value):
     ).execute()
 
 
-def update_best_times(discord_id, username, boss_data):
+def update_best_times(discord_name, rsn, boss_data):
     """
     boss_data is a list of: { "boss": name, "fastest": seconds_int }
+
+    Sheet layout:
+      col 0: Discord_name
+      col 1: RSN
+      col 2+: bosses
     """
+    logging.info(f"Updating PBs for Discord_name='{discord_name}', RSN='{rsn}'")
     values, headers = get_sheet()
 
-    # Make sure all bosses have a column
     boss_names = [b["boss"] for b in boss_data]
+    logging.info(f"Bosses found for '{rsn}': {boss_names}")
     headers = ensure_boss_columns(boss_names, headers)
     header_map = build_header_map(headers)
     col_count = len(headers)
 
-    # Find or create the user's row
-    row_index = find_user_row(values, discord_id)
+    # Find or create the row for this Discord_name + RSN pair
+    row_index = find_row(values, discord_name, rsn)
     if row_index == -1:
-        add_user_row(discord_id, username, col_count)
-        # Reload sheet to get the new row
+        add_row(discord_name, rsn, col_count)
         values, headers = get_sheet()
         header_map = build_header_map(headers)
-        row_index = find_user_row(values, discord_id)
+        row_index = find_row(values, discord_name, rsn)
 
     # Make sure row exists and has enough columns
     if row_index >= len(values):
@@ -134,8 +159,12 @@ def update_best_times(discord_id, username, boss_data):
     if len(row) < col_count:
         row = row + [""] * (col_count - len(row))
 
-    # Update username (column B)
-    update_cell(row_index, 1, username)
+    # Make sure the Discord_name and RSN columns are up to date
+    # (handles if they change their Discord display name)
+    if row[0] != discord_name:
+        update_cell(row_index, 0, discord_name)
+    if row[1] != rsn:
+        update_cell(row_index, 1, rsn)
 
     improved = 0
 
@@ -146,6 +175,7 @@ def update_best_times(discord_id, username, boss_data):
 
         col = header_map.get(boss.lower())
         if col is None:
+            logging.warning(f"Column not found for boss '{boss}', skipping.")
             continue
 
         old_val_str = row[col] if col < len(row) else ""
@@ -157,9 +187,13 @@ def update_best_times(discord_id, username, boss_data):
 
         # Only update if better (lower) or no value yet
         if old_val is None or fastest < old_val:
+            logging.info(f"Improved PB for {rsn} / {boss}: old={old_val}, new={fastest}")
             update_cell(row_index, col, fastest)
             improved += 1
+        else:
+            logging.info(f"No improvement for {rsn} / {boss}: old={old_val}, new={fastest}")
 
+    logging.info(f"Total improved bosses for {discord_name} / {rsn}: {improved}")
     return improved
 
 
@@ -179,10 +213,15 @@ def simple_unescape(name: str) -> str:
 
 def parse_rsprofile_properties(text: str):
     """
-    Read an rsprofile--1.properties string and return:
+    Read an rsprofile--1.properties string and return a list of accounts:
 
-    osrs_name (can be None),
-    boss_data = [ { "boss": boss_name, "fastest": seconds_int }, ... ]
+    [
+      {
+        "rsn": "IronDrag94",
+        "boss_data": [ { "boss": "Alchemical Hydra", "fastest": 112 }, ... ]
+      },
+      ...
+    ]
     """
 
     type_re = re.compile(r"^rsprofile\.rsprofile\.(\w+)\.type=(.+)$")
@@ -217,40 +256,48 @@ def parse_rsprofile_properties(text: str):
             continue
 
     if not pbs:
-        return None, []
+        logging.warning("No personalbest entries found in file.")
+        return []
 
-    # Choose which profile to use:
-    # Prefer STANDARD profiles that have PBs
-    chosen_hash = None
-    for h, t in types.items():
-        if t == "STANDARD" and h in pbs:
-            chosen_hash = h
-            break
+    accounts = []
 
-    # If none found, just use the first PB hash
-    if chosen_hash is None:
-        chosen_hash = next(iter(pbs.keys()))
-
-    osrs_name = names.get(chosen_hash)
-    boss_data = []
-
-    for boss_raw, value_raw in pbs[chosen_hash].items():
-        boss_name = simple_unescape(boss_raw)
-
-        try:
-            seconds = float(value_raw)
-            seconds = int(round(seconds))
-        except ValueError:
+    for hash_id, boss_map in pbs.items():
+        rsn = names.get(hash_id)
+        if not rsn:
+            logging.info(f"Skipping hash '{hash_id}' with PBs but no displayName.")
             continue
 
-        boss_data.append({
-            "boss": boss_name,
-            "fastest": seconds,
+        account_bosses = []
+        for boss_raw, value_raw in boss_map.items():
+            boss_name = simple_unescape(boss_raw)
+
+            try:
+                seconds = float(value_raw)
+                seconds = int(round(seconds))
+            except ValueError:
+                logging.error(
+                    f"Could not parse PB value '{value_raw}' "
+                    f"for boss '{boss_name}' (RSN '{rsn}')"
+                )
+                continue
+
+            account_bosses.append({
+                "boss": boss_name,
+                "fastest": seconds,
+            })
+
+        if not account_bosses:
+            logging.info(f"No valid PBs for RSN '{rsn}', skipping.")
+            continue
+
+        logging.info(f"Found {len(account_bosses)} PBs for RSN '{rsn}'.")
+        accounts.append({
+            "rsn": rsn,
+            "boss_data": account_bosses,
         })
 
-    # Sort for consistency (optional)
-    boss_data.sort(key=lambda x: x["boss"].lower())
-    return osrs_name, boss_data
+    logging.info(f"Total RS accounts with PBs in file: {len(accounts)}")
+    return accounts
 
 
 # ---------------- Discord bot setup ---------------- #
@@ -263,7 +310,7 @@ client = discord.Client(intents=intents)
 
 @client.event
 async def on_ready():
-    print(f"Logged in as {client.user}")
+    logging.info(f"Logged in as {client.user}")
 
 
 @client.event
@@ -272,7 +319,6 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    # Only listen in the configured channel
     if message.channel.id != UPLOAD_CHANNEL_ID:
         return
 
@@ -284,35 +330,99 @@ async def on_message(message: discord.Message):
 
     # We only care about RuneLite profile .properties files
     if not (filename_lower.endswith(".properties") and "rsprofile" in filename_lower):
-        return
-
-    await message.reply("Found RuneLite profile file, reading boss personal bests...")
-
-    # Download the file bytes and decode as text
-    data = await attachment.read()
-    text = data.decode("utf-8", errors="ignore")
-
-    osrs_name, boss_data = parse_rsprofile_properties(text)
-
-    if not boss_data:
-        await message.reply(
-            "I couldn't find any boss personal bests in that file.\n"
-            "Make sure it's your `rsprofile--1.properties` from `~/.runelite/profiles2/` "
-            "and that you have at least one boss PB."
+        logging.info(
+            f"Ignoring attachment from {message.author} "
+            f"(filename={attachment.filename}) - not an rsprofile properties file."
         )
         return
 
-    # Use RuneLite name if we have it, otherwise Discord display name
-    name_for_sheet = osrs_name or message.author.display_name
-
-    improved = update_best_times(
-        str(message.author.id),
-        name_for_sheet,
-        boss_data,
+    logging.info(
+        f"Received rsprofile file from {message.author} "
+        f"in #{message.channel} (filename={attachment.filename})"
     )
 
-    extra = f" for **{osrs_name}**" if osrs_name else ""
-    await message.reply(f"Updated PBs{extra}! Improved **{improved}** boss time(s).")
+    # Try to DM the user that we're processing their file
+    try:
+        await message.author.send(
+            "📥 I got your RuneLite profile file. "
+            "Processing ALL accounts and boss personal bests now..."
+        )
+    except discord.Forbidden:
+        logging.warning(f"Could not DM {message.author} to confirm receipt (DMs disabled?).")
+
+    # Download and parse the file
+    try:
+        data = await attachment.read()
+        text = data.decode("utf-8", errors="ignore")
+    except Exception as e:
+        logging.exception("Error reading attachment data.")
+        try:
+            await message.author.send(f"❌ Error reading your file: {e}")
+        except discord.Forbidden:
+            await message.channel.send(
+                f"{message.author.mention} ❌ Error reading your file (and I couldn't DM you).",
+                delete_after=15
+            )
+        # Try to delete the original message anyway
+        try:
+            await message.delete()
+        except discord.Forbidden:
+            logging.warning("Could not delete user message (missing Manage Messages permission).")
+        return
+
+    accounts = parse_rsprofile_properties(text)
+
+    if not accounts:
+        try:
+            await message.author.send(
+                "❌ I couldn't find any boss personal bests in that file.\n"
+                "Make sure it's your `rsprofile--1.properties` from `~/.runelite/profiles2/` "
+                "and that you have at least one boss PB on at least one account."
+            )
+        except discord.Forbidden:
+            await message.channel.send(
+                f"{message.author.mention} ❌ No boss PBs found in that file "
+                "(and I couldn't DM you).",
+                delete_after=20
+            )
+    else:
+        discord_name = message.author.display_name or message.author.name
+
+        lines = []
+        for account in accounts:
+            rsn = account["rsn"]
+            boss_data = account["boss_data"]
+
+            try:
+                improved = update_best_times(
+                    discord_name,
+                    rsn,
+                    boss_data,
+                )
+                lines.append(f"- RSN **{rsn}**: improved **{improved}** boss time(s).")
+            except Exception as e:
+                logging.exception(f"Error updating sheet for RSN '{rsn}'.")
+                lines.append(f"- RSN **{rsn}**: ❌ error updating PBs: {e}")
+
+        summary = "✅ Finished updating your PBs.\n" + "\n".join(lines)
+
+        try:
+            await message.author.send(summary)
+        except discord.Forbidden:
+            logging.warning(f"Could not DM {message.author} PB summary, sending in channel.")
+            await message.channel.send(
+                f"{message.author.mention} {summary}",
+                delete_after=30
+            )
+
+    # Finally, try to delete the original message (remove the file from the channel)
+    try:
+        await message.delete()
+        logging.info(f"Deleted upload message from {message.author}.")
+    except discord.Forbidden:
+        logging.warning(
+            "Could not delete user message - bot likely missing 'Manage Messages' permission."
+        )
 
 
 client.run(DISCORD_TOKEN)
